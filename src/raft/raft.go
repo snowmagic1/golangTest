@@ -95,6 +95,7 @@ type Raft struct {
 	nextIndex []int
 	matchIndex []int
 	heartbeatSendTimer *time.Timer
+	commitIndexMutex *sync.Mutex
 }
 
 // return currentTerm and whether this server
@@ -212,7 +213,7 @@ func (rf *Raft) sendRequestVote(server int) {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, &reply)
 	
 	if(!ok) {
-		fmt.Printf("failed to sendRequestVote to %v\n", server)	
+		// fmt.Printf("failed to sendRequestVote to %v\n", server)	
 		return
 	}
 	
@@ -265,19 +266,41 @@ func (rf *Raft) LastIndex() int {
 	return rf.logs[len(rf.logs) - 1].Index	
 }
 
+func (rf *Raft) TryCommit() {
+	// fmt.Printf("TryCommit %v > %v\n", rf.commitIndex, rf.lastApplied)
+	
+	if(rf.commitIndex > rf.lastApplied) {
+		for i:=rf.lastApplied+1;i<=rf.commitIndex;i++ {
+			msg := ApplyMsg{}
+			msg.Index = i+1
+			msg.Command = rf.logs[i].Command
+			
+			fmt.Printf("====> %v commit %v\n", rf.me, i)
+			rf.applyCh <- msg
+			
+			rf.lastApplied = i
+		}
+	}	
+}
+
 func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) {
 	// Your code here.
 
 	reply.Term = rf.currentTerm
 	reply.Success = false
 	
-	// fmt.Printf("append entries curr %v lead %v\n", rf.me, args.Term)
+	// fmt.Printf("%v append entries lead %v prevIndex %v\n", rf.me, args.Term, args.PrevLogIndex)
 	
 	rf.heartbeatTimer.Reset(time.Millisecond * 
 		time.Duration(rf.heartbeatTimeout))
-		
+	
+	// If AppendEntries RPC received from new leader: convert to follower
+	if(rf.state == Candidate) {
+		rf.becomeFollower(args.Term)
+	}	
+	
 	if(args.Term < rf.currentTerm) {
-		fmt.Printf("%v ignore older term, %v<%v\n", rf.me, args.Term, rf.currentTerm)
+		fmt.Printf("%v ignore older term, %v<%v \n", rf.me, args.Term, rf.currentTerm)
 		return
 	}
 	
@@ -301,19 +324,17 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 	// agreement on prev logs
 	reply.Success = true
 	
-	// heartbeat
-	if(len(args.Entries) == 0) {
-		return	
-	}
+	if(len(args.Entries) > 0) {
 	
-	// copy leader's log entries
-	for _, newEntry := range args.Entries {
-		if(rf.LastIndex() >= newEntry.Index){
-			rf.logs[newEntry.Index] = newEntry
-		} else {
-			rf.logs = append(rf.logs, newEntry)
-			
-			fmt.Printf("%v append entry index %v\n", rf.me, newEntry.Index)
+		// copy leader's log entries
+		for _, newEntry := range args.Entries {
+			if(rf.LastIndex() >= newEntry.Index){
+				rf.logs[newEntry.Index] = newEntry
+			} else {
+				rf.logs = append(rf.logs, newEntry)
+				
+				fmt.Printf("%v append entry index %v\n", rf.me, newEntry.Index)
+			}
 		}
 	}
 	
@@ -322,22 +343,12 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 	if(args.LeaderCommit > rf.commitIndex) {
 		lastIndex := rf.LastIndex()
 		rf.commitIndex = int(math.Min(float64(args.LeaderCommit), float64(lastIndex)))
-		
-		fmt.Printf("%v commitIndex is %v now leader %v last %v\n", rf.me, rf.commitIndex, args.LeaderCommit, lastIndex)
+		rf.TryCommit()
+		// fmt.Printf("%v commitIndex is %v now leader %v last %v\n", rf.me, rf.commitIndex, args.LeaderCommit, lastIndex)
 	}
 	
-	if(rf.commitIndex > rf.lastApplied) {
-		for i:=rf.lastApplied+1;i<=rf.commitIndex;i++ {
-			msg := ApplyMsg{}
-			msg.Index = i
-			msg.Command = rf.logs[i].Command
-			
-			fmt.Printf("%v commit %v\n", rf.me, msg.Index)
-			rf.applyCh <- msg
-			
-			rf.lastApplied = i
-		}
-	}
+	// fmt.Printf("%v commitIndex %v > lastApplied %v\n", rf.me, rf.commitIndex, rf.lastApplied)
+	
 	
 	rf.leaderID = args.LeaderID
 	
@@ -347,8 +358,8 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 func (rf *Raft) isAgreed(index int) bool {
 	majority := len(rf.peers)/2 + 1
 	
-	copied := 0
-	for match := range rf.matchIndex {
+	copied := 1 // Lead has one copy
+	for _, match := range rf.matchIndex {
 		if(match >= index) {
 			copied ++
 		}
@@ -356,8 +367,11 @@ func (rf *Raft) isAgreed(index int) bool {
 	
 	// fmt.Printf("%v copied %v\n", index, copied)
 	if(copied >= majority) {
+		// fmt.Printf("  %v agreed \n", index)
 		return true
 	}
+	
+	// fmt.Printf("  %v not agreed \n", index)
 	
 	return false
 }
@@ -376,6 +390,7 @@ func (rf *Raft) sendAppend(server int) {
 	}
 	
 	lastIndex := rf.LastIndex()
+	fmt.Printf("%v sendAppend prev %v total %v\n", rf.me, args.PrevLogIndex+1, rf.LastIndex())
 	args.Entries = rf.logs[args.PrevLogIndex+1:]
 	args.LeaderCommit = rf.commitIndex
 	
@@ -385,8 +400,10 @@ func (rf *Raft) sendAppend(server int) {
 		// fmt.Printf("%v appends index %v term %v %v\n", server, args.PrevLogIndex, args.PrevLogTerm, reply.Success)
 		if(reply.Success){
 			rf.nextIndex[server] = lastIndex + 1
-			rf.matchIndex[server] = lastIndex + 1
+			rf.matchIndex[server] = lastIndex
 			
+			fmt.Printf("%v matchIndex => %v\n", server, rf.matchIndex[server])
+			rf.commitIndexMutex.Lock()
 			for i := rf.commitIndex + 1;i<=lastIndex;i++ {
 				if(rf.isAgreed(i)) {
 					
@@ -396,12 +413,20 @@ func (rf *Raft) sendAppend(server int) {
 					break
 				}
 			}
+			rf.commitIndexMutex.Unlock()
+			
+			rf.TryCommit()
+			
 		} else {
 			fmt.Printf("%v appends index %v term %v %v\n", server, args.PrevLogIndex, args.PrevLogTerm, reply.Success)
-			rf.nextIndex[server] --
+			if(rf.nextIndex[server] > 0) {
+				rf.nextIndex[server] --
+			}
 			go rf.sendAppend(server);
 		}
-	}	
+	} else {
+		fmt.Printf("== Error: Failed to Append %v appends index %v term %v\n", server, args.PrevLogIndex, args.PrevLogTerm)
+	}
 }
 
 func (rf *Raft) bcastAppend() {
@@ -430,8 +455,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		entry.Command = command
 		
 		rf.logs = append(rf.logs, entry)
-		fmt.Printf("Start - last index %v term %v\n", rf.LastIndex(), entry.Term)
-		return entry.Index,entry.Term, true
+		fmt.Printf("----- Start - last index %v term %v -----\n", rf.LastIndex(), entry.Term)
+		return entry.Index+1,entry.Term, true
 	} 
 	
 	return index, term, false
@@ -594,6 +619,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastApplied = -1
 	rf.rand = rand.New(rand.NewSource(int64(me)))
 	rf.votesLock = &sync.Mutex{}
+	rf.commitIndexMutex = &sync.Mutex{}
 	
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
