@@ -176,10 +176,26 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	
 	// fmt.Printf("%v voted for is %v\n", rf.me, rf.votedFor)
 	if(rf.votedFor == -1 || rf.votedFor == args.ID) {
-		// if(args.LastLogIndex >= rf.commitIndex) {
-			reply.VoteGranted = true
-			rf.votedFor = args.ID
-		// }
+		if(rf.LastIndex() != -1) {
+			lastLog := rf.logs[rf.LastIndex()]
+			
+			if(args.LastLogTerm < lastLog.Term) {
+				fmt.Printf("%v candidate's log is not up to date term %v < %v\n", 
+					rf.me, args.LastLogTerm, lastLog.Term)
+					
+				return	
+			}
+			
+			if(args.LastLogTerm == lastLog.Term && args.LastLogIndex < lastLog.Index) {
+				fmt.Printf("%v candidate's log is not up to date index %v < %v\n", 
+					rf.me, args.LastLogIndex, lastLog.Index)
+					
+				return
+			}
+		}
+		
+		reply.VoteGranted = true
+		rf.votedFor = args.ID
 	}
 }
 
@@ -275,7 +291,7 @@ func (rf *Raft) TryCommit() {
 			msg.Index = i+1
 			msg.Command = rf.logs[i].Command
 			
-			fmt.Printf("====> %v commit %v\n", rf.me, i)
+			fmt.Printf("====> %v commit %v - %v \n", rf.me, i, msg.Command.(int))
 			rf.applyCh <- msg
 			
 			rf.lastApplied = i
@@ -291,22 +307,37 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 	
 	// fmt.Printf("%v append entries lead %v prevIndex %v\n", rf.me, args.Term, args.PrevLogIndex)
 	
-	rf.heartbeatTimer.Reset(time.Millisecond * 
-		time.Duration(rf.heartbeatTimeout))
-	
-	// If AppendEntries RPC received from new leader: convert to follower
-	if(rf.state == Candidate) {
-		rf.becomeFollower(args.Term)
-	}	
-	
+	//
+	// 1. handle disconnected servers rejoin after network partition happened 
+	//
+
+	// Ignore msgs from old leader, not reset heartbeat timer
 	if(args.Term < rf.currentTerm) {
 		fmt.Printf("%v ignore older term, %v<%v \n", rf.me, args.Term, rf.currentTerm)
 		return
-	}
+	}	
+	// If AppendEntries RPC received from new leader: convert to follower
+	// for the case that candidate or follower became disconnected then come back
+	// Candidate's current term may > current leader's term
+	if(rf.state == Candidate) {
+		fmt.Printf("%v Candidate -> follower\n", rf.me)
+		rf.becomeFollower(args.Term)
+	}	
 	
+	// for the case that leader became disconnected then come back
 	if(rf.currentTerm < args.Term) {
+		fmt.Printf("%v new term received state %v term %v<%v\n",
+			rf.me, rf.state, rf.currentTerm, args.Term)
+			
 		rf.becomeFollower(args.Term)
 	}
+	
+	rf.heartbeatTimer.Reset(time.Millisecond * 
+		time.Duration(rf.heartbeatTimeout))
+	
+	//
+	// 2. replicate log entries from current lead
+	//
 	
 	if(args.PrevLogIndex != -1 && rf.LastIndex() < args.PrevLogIndex){
 		fmt.Printf("%v log doesn't exist, %v<%v\n", rf.me, rf.LastIndex(), args.PrevLogIndex)
@@ -337,6 +368,10 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 			}
 		}
 	}
+	
+	// 
+	// 3. commit log entries
+	//
 	
 	// If leaderCommit > commitIndex, set commitIndex =
 	// min(leaderCommit, index of last new entry)
@@ -390,20 +425,27 @@ func (rf *Raft) sendAppend(server int) {
 	}
 	
 	lastIndex := rf.LastIndex()
-	fmt.Printf("%v sendAppend prev %v total %v\n", rf.me, args.PrevLogIndex+1, rf.LastIndex())
+	// fmt.Printf("%v sendAppend prev %v total %v\n", rf.me, args.PrevLogIndex+1, rf.LastIndex())
 	args.Entries = rf.logs[args.PrevLogIndex+1:]
 	args.LeaderCommit = rf.commitIndex
 	
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, &reply)
 	
+	if(rf.state != Leader) {
+		return	
+	}
+	
+	// fmt.Printf("  %v result: %v appends index %v term %v %v\n", 
+	//	rf.me, server, args.PrevLogIndex, args.PrevLogTerm, reply.Success)
 	if(ok) {
-		// fmt.Printf("%v appends index %v term %v %v\n", server, args.PrevLogIndex, args.PrevLogTerm, reply.Success)
+		
 		if(reply.Success){
 			rf.nextIndex[server] = lastIndex + 1
 			rf.matchIndex[server] = lastIndex
 			
-			fmt.Printf("%v matchIndex => %v\n", server, rf.matchIndex[server])
+			// fmt.Printf("%v matchIndex => %v\n", server, rf.matchIndex[server])
 			rf.commitIndexMutex.Lock()
+			
 			for i := rf.commitIndex + 1;i<=lastIndex;i++ {
 				if(rf.isAgreed(i)) {
 					
@@ -413,19 +455,22 @@ func (rf *Raft) sendAppend(server int) {
 					break
 				}
 			}
-			rf.commitIndexMutex.Unlock()
 			
 			rf.TryCommit()
 			
+			rf.commitIndexMutex.Unlock()
+			
 		} else {
 			fmt.Printf("%v appends index %v term %v %v\n", server, args.PrevLogIndex, args.PrevLogTerm, reply.Success)
-			if(rf.nextIndex[server] > 0) {
+			if(reply.Term > rf.currentTerm) {
+				rf.becomeFollower(reply.Term)	
+			} else if(rf.nextIndex[server] > 0) {
 				rf.nextIndex[server] --
+				go rf.sendAppend(server);
 			}
-			go rf.sendAppend(server);
 		}
 	} else {
-		fmt.Printf("== Error: Failed to Append %v appends index %v term %v\n", server, args.PrevLogIndex, args.PrevLogTerm)
+		fmt.Printf("== Error: Failed to send AppendEntries RPC server %v index %v term %v\n", server, args.PrevLogIndex, args.PrevLogTerm)
 	}
 }
 
@@ -455,7 +500,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		entry.Command = command
 		
 		rf.logs = append(rf.logs, entry)
-		fmt.Printf("----- Start - last index %v term %v -----\n", rf.LastIndex(), entry.Term)
+		fmt.Printf("----- Start - last index %v term %v command %v -----\n", 
+			rf.LastIndex(), entry.Term, command.(int))
+			
 		return entry.Index+1,entry.Term, true
 	} 
 	
@@ -513,7 +560,7 @@ func (rf *Raft) becomeLeader() {
 	rf.reset(rf.currentTerm)
 	peersNum := len(rf.peers)
 	rf.nextIndex = make([]int, peersNum, peersNum)
-	for i:=0;i<len(rf.nextIndex);i++ {
+for i:=0;i<len(rf.nextIndex);i++ {
 		rf.nextIndex[i] = rf.LastIndex() + 1
 	}
 	
