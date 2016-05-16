@@ -120,9 +120,12 @@ func (rf *Raft) persist() {
 	e := gob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
+	e.Encode(rf.logs)
 	data := w.Bytes()
 	
 	rf.persister.SaveRaftState(data)
+	
+	// fmt.Printf("+++++ persist\n")
 }
 
 //
@@ -131,10 +134,15 @@ func (rf *Raft) persist() {
 func (rf *Raft) readPersist(data []byte) {
 	// Your code here.
 	// Example:
+	
 	r := bytes.NewBuffer(data)
 	d := gob.NewDecoder(r)
 	d.Decode(&rf.currentTerm)
 	d.Decode(&rf.votedFor)
+	d.Decode(&rf.logs)
+	
+	// fmt.Printf("+++++ readPersist %v last index %v\n", 
+	//	rf.me, rf.LastIndex())
 }
 
 //
@@ -196,6 +204,8 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 		
 		reply.VoteGranted = true
 		rf.votedFor = args.ID
+		
+		rf.persist()
 	}
 }
 
@@ -223,8 +233,15 @@ func (rf *Raft) sendRequestVote(server int) {
 	
 	args.Term = rf.currentTerm
 	args.ID = rf.me
-	args.LastLogIndex = rf.lastApplied
-	args.LastLogTerm = rf.currentTerm
+	
+	if(rf.LastIndex() < 0){
+		args.LastLogIndex = -1
+		args.LastLogTerm = -1	
+	} else {
+		lastLog := rf.logs[rf.LastIndex()]
+		args.LastLogIndex = lastLog.Index
+		args.LastLogTerm = lastLog.Term
+	}
 	
 	ok := rf.peers[server].Call("Raft.RequestVote", args, &reply)
 	
@@ -247,6 +264,11 @@ func (rf *Raft) sendRequestVote(server int) {
 	
 	count := rf.votedCount()
 	// fmt.Printf("%d got %d votes\n", rf.me, count)
+	
+	if(reply.Term > rf.currentTerm) {
+		rf.becomeFollower(rf.currentTerm)
+		return	
+	}
 	
 	majority := len(rf.peers)/2+1
 		
@@ -369,6 +391,8 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 		}
 	}
 	
+	rf.persist()
+	
 	// 
 	// 3. commit log entries
 	//
@@ -447,6 +471,12 @@ func (rf *Raft) sendAppend(server int) {
 			rf.commitIndexMutex.Lock()
 			
 			for i := rf.commitIndex + 1;i<=lastIndex;i++ {
+				
+				// not commit logs from previous term
+				if(rf.logs[i].Term != rf.currentTerm) {
+					continue
+				}
+				
 				if(rf.isAgreed(i)) {
 					
 					rf.commitIndex = i
@@ -466,11 +496,12 @@ func (rf *Raft) sendAppend(server int) {
 				rf.becomeFollower(reply.Term)	
 			} else if(rf.nextIndex[server] > 0) {
 				rf.nextIndex[server] --
+				fmt.Printf("%v nextIndex is %v now \n", server, rf.nextIndex[server])
 				go rf.sendAppend(server);
 			}
 		}
 	} else {
-		fmt.Printf("== Error: Failed to send AppendEntries RPC server %v index %v term %v\n", server, args.PrevLogIndex, args.PrevLogTerm)
+		// fmt.Printf("== Error: Failed to send AppendEntries RPC server %v index %v term %v\n", server, args.PrevLogIndex, args.PrevLogTerm)
 	}
 }
 
@@ -502,7 +533,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.logs = append(rf.logs, entry)
 		fmt.Printf("----- Start - last index %v term %v command %v -----\n", 
 			rf.LastIndex(), entry.Term, command.(int))
-			
+		
+		rf.persist()
+		
 		return entry.Index+1,entry.Term, true
 	} 
 	
@@ -571,7 +604,7 @@ for i:=0;i<len(rf.nextIndex);i++ {
 	go func ()  {
 		for {
 			
-			fmt.Printf("send HB \n")
+			// fmt.Printf("send HB \n")
 			go rf.bcastAppend()
 			<- rf.heartbeatSendTimer.C
 		}	
