@@ -54,14 +54,14 @@ func (ck *Clerk) Get(key string) string {
 			
 			for i, server := range ck.servers {
 				ok := server.Call("RaftKV.Get", &args, &reply)
-				// fmt.Printf("----> %v Get ok %v reply %v\n", 
-				//	i, ok, reply)
+				fmt.Printf("----> %v Get ok %v reply %v\n", 
+					i, ok, reply)
 					
 				if(!ok || reply.WrongLeader == "true") {
 					continue
 				}
 				
-				// fmt.Printf("----> leader is %v\n", i)
+				fmt.Printf("    leader is %v\n", i)
 				ck.leaderId = i
 				
 				break
@@ -71,6 +71,7 @@ func (ck *Clerk) Get(key string) string {
 			ok := ck.servers[ck.leaderId].Call("RaftKV.Get", &args, &reply)
 			
 			if(!ok || reply.WrongLeader == "true") {
+				fmt.Printf("    leader %v unreachable \n", ck.leaderId)
 				ck.leaderId = -1
 			}
 		}
@@ -120,14 +121,14 @@ func (ck *Clerk) PutAppend(key string, value string, op OPCode) {
 			
 			for i, server := range ck.servers {
 				ok := server.Call("RaftKV.PutAppend", &args, &reply)
-				//fmt.Printf("----> %v PutAppend ok %v reply %v\n", 
-				//	i, ok, reply)
+				fmt.Printf("----> %v PutAppend ok %v reply %v\n", 
+					i, ok, reply)
 					
 				if(!ok || reply.WrongLeader == "true") {
 					continue
 				}
 				
-				fmt.Printf("----> leader is %v\n", i)
+				fmt.Printf("    leader is %v\n", i)
 				ck.leaderId = i
 				
 				break

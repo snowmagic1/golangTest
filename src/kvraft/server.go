@@ -99,6 +99,9 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 
 func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	
+	reply.Err = Err_Success
+	reply.WrongLeader = "false"
+	
 	wrongLeader, _ := kv.TryCommit(args.Key, args.Value, args.Op)
 	
 	if(wrongLeader) {
@@ -203,7 +206,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	
 	go kv.HandleApplyMsg()
 	
-	fmt.Println()
+	fmt.Printf("===== StartKVServer %v =====\n", me)
 	
 	return kv
 }
