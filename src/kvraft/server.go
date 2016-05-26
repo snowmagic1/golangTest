@@ -27,6 +27,12 @@ type Op struct {
 	Code OPCode
 	Key string
 	Val string
+	Ch chan Op
+}
+
+type OpResponse struct {
+	Result string
+	Ch chan string
 }
 
 type RaftKV struct {
@@ -41,40 +47,47 @@ type RaftKV struct {
 	states  map[string]string
 	statesMu *sync.Mutex
 	
-	currID int
-	currIDMu *sync.Mutex
-	
-	rpcMap map[int]chan string
+	rpcMap map[int]OpResponse
 	rpcMapMu *sync.Mutex
+
+	Leader bool
 }
 
-func (kv *RaftKV) TryCommit(key string, val string, op OPCode) (wrongLeader bool, result string) {
+func (kv *RaftKV) TryCommit(id int, key string, val string, op OPCode) (wrongLeader bool, result string) {
 	
 	wrongLeader = false
+	
+	response, ok := kv.rpcMap[id]
+	if(ok) {
+		result = response.Result
+		return
+	}
 	
 	command := Op{}
 	command.Key = key
 	command.Val = val
 	command.Code = op
+	command.ID = id
 	
-	kv.currIDMu.Lock()
-	kv.currID ++
-	command.ID = kv.currID
-	kv.currIDMu.Unlock()
 	_, _, isLeader := kv.rf.Start(command)
-	if(!isLeader) {
+	// fmt.Printf("## server, %v isleader %v tryCommit [%v]\n", kv.me, isLeader, key)
+	if(isLeader == false) {
 		wrongLeader = true
-		// fmt.Printf("%v wrong leader\n", kv.me)
+		kv.Leader = false
+		// fmt.Printf("server, %v wrong leader\n", kv.me)
 		return
 	}
 	
-	ch := make(chan string)
+	kv.Leader = true
+	opRes := OpResponse{}
+	opRes.Ch = make(chan string)
 	
 	kv.rpcMapMu.Lock()
-	kv.rpcMap[command.ID] = ch
+	kv.rpcMap[command.ID] = opRes
 	kv.rpcMapMu.Unlock()
 	
-	result =<- ch
+	result =<- opRes.Ch
+	opRes.Result = result
 	
 	return	
 }
@@ -83,15 +96,20 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 	reply.Err = Err_Success	
 	reply.WrongLeader = "false"
+	reply.ServerId = kv.me
+	fmt.Printf(">> server ID [%v] %v Get key [%v] \n", args.ID, kv.me, args.Key)
 	
-	wrongLeader, result := kv.TryCommit(args.Key, "", Get)
+	wrongLeader, result := kv.TryCommit(args.ID, args.Key, "", Get)
 	
 	if(wrongLeader) {
 		reply.WrongLeader = "true"
+		kv.Leader = false
+		fmt.Printf("#### server: %v wrong leader\n", kv.me)
 		return
 	}
 	
-	fmt.Printf(">> server %v Get key [%v] = %v\n", kv.me, args.Key, result)
+	kv.Leader = true
+	// fmt.Printf(">> server ID [%v] %v Get key [%v] = %v\n", args.ID, kv.me, args.Key, result)
 	reply.Value = result
 	
 	return
@@ -101,11 +119,13 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	
 	reply.Err = Err_Success
 	reply.WrongLeader = "false"
+	reply.ServerId = kv.me
 	
-	wrongLeader, _ := kv.TryCommit(args.Key, args.Value, args.Op)
+	wrongLeader, _ := kv.TryCommit(args.ID, args.Key, args.Value, args.Op)
 	
 	if(wrongLeader) {
 		reply.WrongLeader = "true"
+		// fmt.Printf("#### server: %v wrong leader\n", kv.me)
 		return
 	}
 	
@@ -123,48 +143,56 @@ func (kv *RaftKV) Kill() {
 	// Your code here, if desired.
 }
 
+func (kv *RaftKV) ApplyToStateMachine(applyCmd Op) (result string) {
+	
+	log := ""
+	result = ""
+	
+	kv.statesMu.Lock()
+	
+	if(applyCmd.Code == Put) {
+		kv.states[applyCmd.Key] = applyCmd.Val
+		
+		log = fmt.Sprintf("=== server %v, apply [#%v] Put [%v] = [%v]\n", 
+				kv.me, applyCmd.ID, applyCmd.Key, kv.states[applyCmd.Key])
+		
+	} else if(applyCmd.Code == Append){
+		kv.states[applyCmd.Key] += applyCmd.Val
+		
+		log = fmt.Sprintf("=== server %v, apply [#%v] Append [%v] = [%v]\n", 
+			kv.me, applyCmd.ID, applyCmd.Key, kv.states[applyCmd.Key])
+			
+	} else {
+		result = kv.states[applyCmd.Key]
+		
+		log = fmt.Sprintf("=== server %v, apply [#%v] Get [%v] = [%v]\n", 
+			kv.me, applyCmd.ID, applyCmd.Key, result)
+	}
+	
+	kv.statesMu.Unlock()
+	
+	if(kv.Leader) {
+		fmt.Printf(log)
+	}
+	
+	return
+}
+
 func (kv *RaftKV) HandleApplyMsg() {
 	
 	for {
-		applyCmd := Op{}
 		
 		applyMsg :=<- kv.applyCh
 		
-		applyCmd = applyMsg.Command.(Op)
+		applyCmd := applyMsg.Command.(Op)
 	
-		result := ""
-		log := ""
+		result := kv.ApplyToStateMachine(applyCmd)
 		
-		kv.statesMu.Lock()
-	
-		if(applyCmd.Code == Put) {
-			kv.states[applyCmd.Key] = applyCmd.Val
-			
-			log = fmt.Sprintf("=== server %v Put [%v] = [%v]\n", 
-					kv.me, applyCmd.Key, kv.states[applyCmd.Key])
-			
-		} else if(applyCmd.Code == Append){
-			kv.states[applyCmd.Key] += applyCmd.Val
-			
-			log = fmt.Sprintf("=== server %v Append [%v] = [%v]\n", 
-				kv.me, applyCmd.Key, kv.states[applyCmd.Key])
-				
-		} else {
-			result = kv.states[applyCmd.Key]
-			
-			log = fmt.Sprintf("=== server %v Get [%v] = [%v]\n", 
-				kv.me, applyCmd.Key, result)
-		}
-		
-		fmt.Printf(log)
-		
-		kv.statesMu.Unlock()
-	
 		kv.rpcMapMu.Lock()
-		ch := kv.rpcMap[applyCmd.ID]
+		opRes := kv.rpcMap[applyCmd.ID]
 		kv.rpcMapMu.Unlock()
 		
-		ch <- result
+		opRes.Ch <- result
 	}
 	
 }
@@ -198,10 +226,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.states = make(map[string]string)
 	kv.statesMu = &sync.Mutex{}
 	
-	kv.currID = 0
-	kv.currIDMu = &sync.Mutex{}
-	
-	kv.rpcMap = make(map[int]chan string)
+	kv.rpcMap = make(map[int]OpResponse)
 	kv.rpcMapMu = &sync.Mutex{}
 	
 	go kv.HandleApplyMsg()
