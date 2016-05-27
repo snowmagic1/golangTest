@@ -30,9 +30,18 @@ type Op struct {
 	Ch chan Op
 }
 
+type OpState string
+
+const (
+	StatePending = "Pending"
+	StateComplete = "Complete"
+	StateAbort = "Abort"
+)
+
 type OpResponse struct {
 	Result string
-	Ch chan string
+	State OpState
+	Ch chan OpResponse
 }
 
 type RaftKV struct {
@@ -57,8 +66,12 @@ func (kv *RaftKV) TryCommit(id int, key string, val string, op OPCode) (wrongLea
 	
 	wrongLeader = false
 	
+	kv.rpcMapMu.Lock()
 	response, ok := kv.rpcMap[id]
+	kv.rpcMapMu.Unlock()
+	
 	if(ok) {
+		fmt.Printf("server, return cached result ID %v, [%v]=[%v]\n", id, key, response.Result)
 		result = response.Result
 		return
 	}
@@ -80,14 +93,24 @@ func (kv *RaftKV) TryCommit(id int, key string, val string, op OPCode) (wrongLea
 	
 	kv.Leader = true
 	opRes := OpResponse{}
-	opRes.Ch = make(chan string)
+	opRes.Ch = make(chan OpResponse)
 	
 	kv.rpcMapMu.Lock()
 	kv.rpcMap[command.ID] = opRes
 	kv.rpcMapMu.Unlock()
 	
-	result =<- opRes.Ch
-	opRes.Result = result
+	opRes =<- opRes.Ch
+	result = opRes.Result
+	
+	if(opRes.State != StateComplete){
+		fmt.Printf("Op [%v] aborted [%v]\n", command.ID, command.Key)
+		wrongLeader = true
+		return	
+	}
+	
+	kv.rpcMapMu.Lock()
+	kv.rpcMap[command.ID] = opRes
+	kv.rpcMapMu.Unlock()
 	
 	return	
 }
@@ -97,7 +120,7 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 	reply.Err = Err_Success	
 	reply.WrongLeader = "false"
 	reply.ServerId = kv.me
-	fmt.Printf(">> server ID [%v] %v Get key [%v] \n", args.ID, kv.me, args.Key)
+	// fmt.Printf(">> server ID [%v] %v Get key [%v] \n", args.ID, kv.me, args.Key)
 	
 	wrongLeader, result := kv.TryCommit(args.ID, args.Key, "", Get)
 	
@@ -192,9 +215,32 @@ func (kv *RaftKV) HandleApplyMsg() {
 		opRes := kv.rpcMap[applyCmd.ID]
 		kv.rpcMapMu.Unlock()
 		
-		opRes.Ch <- result
+		opRes.Result = result
+		opRes.State = StateComplete
+		
+		opRes.Ch <- opRes
 	}
 	
+}
+
+func (kv *RaftKV) HandleLostLeader() {
+	
+	// if raft lost the leader, abort all the pending requests so client can retry
+	fmt.Printf("!! server %v lost leader\n", kv.me)
+	
+	<-kv.rf.LostLeaderCh
+	
+	kv.rpcMapMu.Lock()
+	for i:=0;i<len(kv.rpcMap);i++ {
+		rpc := kv.rpcMap[i]
+		
+		if(rpc.State == StatePending) {
+			rpc.State = StateAbort
+			rpc.Ch <- rpc
+			kv.rpcMap[i] = rpc
+		}
+	}
+	kv.rpcMapMu.Unlock()
 }
 
 //
@@ -230,6 +276,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rpcMapMu = &sync.Mutex{}
 	
 	go kv.HandleApplyMsg()
+	go kv.HandleLostLeader()
 	
 	fmt.Printf("===== StartKVServer %v =====\n", me)
 	

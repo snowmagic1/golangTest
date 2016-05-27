@@ -11,6 +11,8 @@ type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
 	
+	id int
+	
 	leaderId int
 	
 	currId int
@@ -28,8 +30,13 @@ func nrand() int64 {
 	return x
 }
 
+var gclientID = 0
+
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
+	ck.id = gclientID
+	gclientID++
+	
 	ck.servers = servers
 	ck.leaderId = -1
 	
@@ -51,7 +58,7 @@ func (ck *Clerk) NewID() int {
 	
 	ck.currIdMu.Lock()
 	ck.currId ++
-	newId := ck.currId
+	newId := ck.id*1000 + ck.currId
 	ck.currIdMu.Unlock()
 	
 	return newId
@@ -123,7 +130,7 @@ func (ck *Clerk) ProcessRpcRequest() {
 		}
 		
 		for {
-			// fmt.Printf("client, leaderID %v\n", ck.leaderId)
+			// fmt.Printf("client [%v], leaderID %v\n", ck.id, ck.leaderId)
 			if(ck.leaderId == -1) {
 				
 				for i := 0;i<len(ck.servers);i++ {
@@ -139,8 +146,8 @@ func (ck *Clerk) ProcessRpcRequest() {
 						continue
 					}
 					
-					//fmt.Printf("    leader is %v\n", serverId)
-					ck.leaderId = serverId
+					fmt.Printf("    leader is %v server id %v\n", i, serverId)
+					ck.leaderId = i
 					
 					break
 				}
@@ -156,16 +163,16 @@ func (ck *Clerk) ProcessRpcRequest() {
 						continue
 					}
 					
-					wrongLeader, serverId := ck.WrongLeader(reply)
+					wrongLeader, _ := ck.WrongLeader(reply)
 					
 					if(wrongLeader) {
-						//fmt.Printf("client, wrong leader %v\n", ck.leaderId)
+						fmt.Printf("client, wrong leader %v\n", ck.leaderId)
 						ck.leaderId = -1
 						
 						break;
 					}
 					
-					ck.leaderId = serverId
+					// ck.leaderId = serverId
 					success = true
 					break
 				}
@@ -246,14 +253,14 @@ func (ck *Clerk) Get(key string) string {
 	reply := r.(GetReply)
 	
 	if(reply.Err != Err_Success) {
-		fmt.Printf(">> client, server %v Failed to Get [%v] ,%v\n", 
-			ck.leaderId, key, reply.Err)
+		fmt.Printf(">> client, Failed to Get [%v] ,%v\n", 
+			key, reply.Err)
 		
 		return ""
 	}
 	
-	fmt.Printf(">> client, server %v Get [%v] = %v\n", 
-		ck.leaderId, key, reply.Value)
+	fmt.Printf(">> client, Get [%v] = %v\n", 
+		key, reply.Value)
 				
 	// You will have to modify this function.
 	return reply.Value
@@ -275,14 +282,14 @@ func (ck *Clerk) PutAppend(key string, value string, op OPCode) {
 	reply := r.(PutAppendReply)
 	
 	if(reply.Err != Err_Success) {
-		fmt.Printf(">> client, server %v Failed to PutAppend [%v]=[%v] ,%v\n", 
-			ck.leaderId, key, value, reply.Err)
+		fmt.Printf(">> client, Failed to PutAppend [%v]=[%v] ,%v\n", 
+			key, value, reply.Err)
 		
 		return
 	}
 	
-	fmt.Printf(">> client, server %v PutAppend [%v] = %v\n", 
-		ck.leaderId, key, value)
+	fmt.Printf(">> client, server PutAppend [%v] = %v\n", 
+		key, value)
 		
 	return
 }
