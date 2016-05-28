@@ -249,6 +249,8 @@ func (ck *Clerk) RpcCallAndWait(key string, value string, op OPCode) (reply inte
 //
 func (ck *Clerk) Get(key string) string {
 	
+	fmt.Printf("client %v start Get %v\n", ck.id, key)
+	
 	r := ck.RpcCallAndWait(key, "", Get)
 	reply := r.(GetReply)
 	

@@ -94,6 +94,7 @@ func (kv *RaftKV) TryCommit(id int, key string, val string, op OPCode) (wrongLea
 	kv.Leader = true
 	opRes := OpResponse{}
 	opRes.Ch = make(chan OpResponse)
+	opRes.State = StatePending
 	
 	kv.rpcMapMu.Lock()
 	kv.rpcMap[command.ID] = opRes
@@ -104,6 +105,7 @@ func (kv *RaftKV) TryCommit(id int, key string, val string, op OPCode) (wrongLea
 	
 	if(opRes.State != StateComplete){
 		fmt.Printf("Op [%v] aborted [%v]\n", command.ID, command.Key)
+		delete(kv.rpcMap, command.ID)
 		wrongLeader = true
 		return	
 	}
@@ -224,23 +226,25 @@ func (kv *RaftKV) HandleApplyMsg() {
 }
 
 func (kv *RaftKV) HandleLostLeader() {
-	
-	// if raft lost the leader, abort all the pending requests so client can retry
-	fmt.Printf("!! server %v lost leader\n", kv.me)
-	
-	<-kv.rf.LostLeaderCh
-	
-	kv.rpcMapMu.Lock()
-	for i:=0;i<len(kv.rpcMap);i++ {
-		rpc := kv.rpcMap[i]
-		
-		if(rpc.State == StatePending) {
-			rpc.State = StateAbort
-			rpc.Ch <- rpc
-			kv.rpcMap[i] = rpc
+	for {
+			
+		<-kv.rf.LostLeaderCh
+
+		// if raft lost the leader, abort all the pending requests so client can retry
+		fmt.Printf("!! server %v lost leader\n", kv.me)
+			
+		kv.rpcMapMu.Lock()
+		for k, v := range kv.rpcMap {
+			
+			if(v.State == StatePending) {
+				fmt.Printf("    server: abort request %v\n", k)
+				v.State = StateAbort
+				v.Ch <- v
+				kv.rpcMap[k] = v
+			}
 		}
+		kv.rpcMapMu.Unlock()
 	}
-	kv.rpcMapMu.Unlock()
 }
 
 //
