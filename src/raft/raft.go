@@ -22,7 +22,7 @@ import "labrpc"
 
 import "bytes"
 import "encoding/gob"
-//import "fmt"
+import "fmt"
 //import "strconv"
 import "math"
 import "math/rand"
@@ -76,7 +76,7 @@ type Raft struct {
 	commitIndex int
 	lastApplied int
 	state RaftState
-	leaderID int
+	// leaderID int
 	
 	rand *rand.Rand
 	applyCh chan ApplyMsg
@@ -96,6 +96,7 @@ type Raft struct {
 	matchIndex []int
 	heartbeatSendTimer *time.Timer
 	commitIndexMutex *sync.Mutex
+	LostLeaderCh chan int
 }
 
 // return currentTerm and whether this server
@@ -314,10 +315,19 @@ func (rf *Raft) TryCommit() {
 			msg.Index = i+1
 			msg.Command = rf.logs[i].Command
 			
-			// fmt.Printf("====> %v commit %v - %v \n", rf.me, i, msg.Command.(int))
-			rf.applyCh <- msg
+			// fmt.Printf("====> raft: %v commit %v \n", rf.me, i)
+			go func() {
+				if(len(rf.applyCh) > 5) {
+					fmt.Printf("!!!!! %v applyCh is full %v !!!!!\n", rf.me, len(rf.applyCh))
+				}
+				
+				fmt.Printf(">> raft: %v apply %v command [%v]\n", rf.me, msg.Index, msg.Command)
+				rf.applyCh <- msg
+			}()
 			
 			rf.lastApplied = i
+			
+			// fmt.Printf("====> raft: %v last applied %v \n", rf.me, rf.lastApplied)
 		}
 	}	
 }
@@ -352,7 +362,10 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 	if(rf.currentTerm < args.Term) {
 		//fmt.Printf("%v new term received state %v term %v<%v\n",
 		//	rf.me, rf.state, rf.currentTerm, args.Term)
-			
+		
+		if(rf.state == Leader) {
+			rf.LostLeaderCh <- 1
+		}
 		rf.becomeFollower(args.Term)
 	}
 	
@@ -410,9 +423,6 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 	}
 	
 	// fmt.Printf("%v commitIndex %v > lastApplied %v\n", rf.me, rf.commitIndex, rf.lastApplied)
-	
-	
-	rf.leaderID = args.LeaderID
 	
 	return 
 }
@@ -496,7 +506,12 @@ func (rf *Raft) sendAppend(server int) {
 		} else {
 			//fmt.Printf("%v appends index %v term %v %v\n", server, args.PrevLogIndex, args.PrevLogTerm, reply.Success)
 			if(reply.Term > rf.currentTerm) {
+				if(rf.state == Leader) {
+					rf.LostLeaderCh <- 1
+				}
+				
 				rf.becomeFollower(reply.Term)	
+				
 			} else if(rf.nextIndex[server] > 0) {
 				if(reply.LastIndex != -1) {
 					rf.nextIndex[server] = reply.LastIndex + 1	
@@ -510,6 +525,8 @@ func (rf *Raft) sendAppend(server int) {
 		}
 	} else {
 		// fmt.Printf("== Error: Failed to send AppendEntries RPC server %v index %v term %v\n", server, args.PrevLogIndex, args.PrevLogTerm)
+		time.Sleep(50 * time.Millisecond)
+		go rf.sendAppend(server);
 	}
 }
 
@@ -539,8 +556,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		entry.Command = command
 		
 		rf.logs = append(rf.logs, entry)
-		//fmt.Printf("----- Start - %v last index %v term %v command %v -----\n", 
-		//	rf.me, rf.LastIndex(), entry.Term, command.(int))
+		// fmt.Printf("----- raft: Start - %v last index %v term %v command [%v] -----\n", 
+		//	rf.me, rf.LastIndex(), entry.Term, command)
 		
 		rf.persist()
 		
@@ -596,7 +613,7 @@ func (rf *Raft) reset(term int) {
 }
 
 func (rf *Raft) becomeLeader() {
-	//fmt.Printf("%d become leader at term %d\n", rf.me, rf.currentTerm)
+	fmt.Printf("**** [raft]: %d become leader at term %d\n", rf.me, rf.currentTerm)
 	
 	rf.reset(rf.currentTerm)
 	peersNum := len(rf.peers)
@@ -624,11 +641,11 @@ func (rf *Raft) becomeCandidate() {
 	rf.state = Candidate
 	rf.votedFor = rf.me
 	rf.votes = make(map[int]bool)
-	//fmt.Printf("%d become candidate at term %d\n", rf.me, rf.currentTerm)
+	// fmt.Printf("%d become candidate at term %d\n", rf.me, rf.currentTerm)
 }
 
 func (rf *Raft) becomeFollower(term int) {
-	//fmt.Printf("%d become follower at term %d\n", rf.me, rf.currentTerm)
+	// fmt.Printf("%d become follower at term %d\n", rf.me, rf.currentTerm)
 	
 	rf.reset(term)
 	rf.state = Follower
@@ -708,11 +725,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.rand = rand.New(rand.NewSource(int64(me)))
 	rf.votesLock = &sync.Mutex{}
 	rf.commitIndexMutex = &sync.Mutex{}
+	rf.LostLeaderCh = make(chan int)
 	
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// fmt.Println("Make " + strconv.Itoa(me))
+	fmt.Println()
+	
 	rf.becomeFollower(rf.currentTerm)
 	return rf
 }
