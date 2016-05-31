@@ -175,8 +175,12 @@ func (ck *Clerk) ProcessRpcRequest() {
 					ok, reply := ck.RpcCall(srv, args)
 					wrongLeader, err := ck.WrongLeader(reply)
 					
+					fmt.Printf("client, RPC call %v args %v, returns wrong leader %v err %v\n",
+						si, args, wrongLeader, err)
+					
 					if ok && wrongLeader == false && (err == OK || err == ErrNoKey) {
 						ck.rpcMap[id] <- reply
+						return
 					}
 					if ok && (err == ErrWrongGroup) {
 						break
@@ -218,6 +222,8 @@ func (ck *Clerk) Get(key string) string {
 	args.Key = key
 	args.ID = ck.NewID()
 	
+	fmt.Printf("\n------> client, Get Index [%v] -----\n", key)
+	
 	r := ck.RpcCallAndWait(args.ID, args)
 	reply := r.(GetReply)
 	
@@ -228,7 +234,7 @@ func (ck *Clerk) Get(key string) string {
 		return ""
 	}
 	
-	fmt.Printf("------ client, Get Index [%v]=[%v] -----\n", key, reply.Value)
+	fmt.Printf("<------ client, Get Index [%v]=[%v] -----\n\n", key, reply.Value)
 	
 	return reply.Value
 }
@@ -244,17 +250,20 @@ func (ck *Clerk) PutAppend(key string, value string, op OPCode) {
 	args.Op = op
 	args.ID = ck.NewID()
 	
+	fmt.Printf("\n------> client, PutAppend Index [%v], [%v] [%v] [%v] -----\n", 
+		args.ID, key, op, value)
+		
 	r := ck.RpcCallAndWait(args.ID, args)
 	reply := r.(PutAppendReply)
 	
 	if(reply.Err != OK) {
-		fmt.Printf(">> client, Index [%v] Failed to PutAppend [%v] [%v] [%v],%v\n", 
+		fmt.Printf(">> client, Index [%v] Failed to PutAppend [%v] [%v] [%v],%v\n\n", 
 			args.ID, key, op, value, reply.Err)
 		
 		return 
 	}
 	
-	fmt.Printf("------ client, PutAppend Index [%v], [%v] [%v] [%v] -----\n", 
+	fmt.Printf("<------ client, PutAppend Index [%v], [%v] [%v] [%v] -----\n", 
 		args.ID, key, op, value)
 	
 	return

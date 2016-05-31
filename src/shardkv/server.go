@@ -45,6 +45,7 @@ const (
 type OpResponse struct {
 	Result string
 	Err Err
+	WrongLeader bool
 	State OpState
 	Ch chan OpResponse
 }
@@ -72,16 +73,19 @@ type ShardKV struct {
 	config   shardmaster.Config
 }
 
-func (kv *ShardKV) TryCommit(id int, key string, val string, op OPCode) (wrongLeader bool, result string) {
+func (kv *ShardKV) TryCommit(id int, key string, val string, op OPCode) (result OpResponse) {
 	
-	wrongLeader = false
+	opRes := OpResponse{}
+	opRes.WrongLeader = false
+	opRes.Err = OK
+	opRes.Result = ""
 	
 	kv.rpcMapMu.Lock()
 	response, ok := kv.rpcMap[id]
 	kv.rpcMapMu.Unlock()
 	
 	if(ok) {
-		result = response.Result
+		opRes.Result = response.Result
 		fmt.Printf("server, return cached result ID %v, [%v] [%v] [%v]\n", id, key, op, val)
 		return
 	}
@@ -94,13 +98,13 @@ func (kv *ShardKV) TryCommit(id int, key string, val string, op OPCode) (wrongLe
 	
 	_, _, isLeader := kv.rf.Start(command)
 	if(isLeader == false) {
-		wrongLeader = true
+		result.WrongLeader = true
 		kv.Leader = false
 		return
 	}
 	
 	kv.Leader = true
-	opRes := OpResponse{}
+
 	opRes.Ch = make(chan OpResponse)
 	opRes.State = StatePending
 	
@@ -109,12 +113,14 @@ func (kv *ShardKV) TryCommit(id int, key string, val string, op OPCode) (wrongLe
 	kv.rpcMapMu.Unlock()
 	
 	opRes =<- opRes.Ch
-	result = opRes.Result
+	result.Err = opRes.Err
+	result.State = opRes.State
+	result.Result = opRes.Result
 	
 	if(opRes.State != StateComplete){
 		fmt.Printf("Op [%v] aborted [%v]\n", command.ID, command.Key)
 		delete(kv.rpcMap, command.ID)
-		wrongLeader = true
+		opRes.WrongLeader = true
 		return	
 	}
 	
@@ -131,7 +137,7 @@ func (kv *ShardKV) ApplyToStateMachine(applyOp Op) (result string, err Err) {
 				kv.me, applyOp)
 	
 	result = ""
-	err = ""
+	err = OK
 				
 	kv.statesMu.Lock()
 	
@@ -223,25 +229,26 @@ func (kv *ShardKV) HandleLostLeader() {
 func (kv *ShardKV) PollConfig() {
 	for {
 		kv.config = kv.sm.Query(-1)
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(500 * time.Millisecond)
 	}
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	reply.Err = ""	
+	reply.Err = OK	
 	reply.WrongLeader = false
 	// fmt.Printf(">> server ID [%v] %v Get key [%v] \n", args.ID, kv.me, args.Key)
 	
 	shard := key2shard(args.Key)
+	kv.config = kv.sm.Query(-1)
 	if(kv.config.Shards[shard] != kv.gid) {
 		reply.Err = ErrWrongGroup
 		return
 	}
 	
-	wrongLeader, result := kv.TryCommit(args.ID, args.Key, "", OPGet)
+	opRes := kv.TryCommit(args.ID, args.Key, "", OPGet)
 	
-	if(wrongLeader) {
+	if(opRes.WrongLeader) {
 		reply.WrongLeader = true
 		kv.Leader = false
 		// fmt.Printf("#### server: %v wrong leader\n", kv.me)
@@ -250,27 +257,33 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	
 	kv.Leader = true
 	// fmt.Printf(">> server ID [%v] %v Get key [%v] = %v\n", args.ID, kv.me, args.Key, result)
-	reply.Value = result
+	reply.Value = opRes.Result
+	// reply.Err = opRes.Err
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	reply.Err = ""
+	reply.Err = OK
 	reply.WrongLeader = false
 	
+	fmt.Printf("server, PutAppend %v, args %v\n", kv.me, args)
+	
 	shard := key2shard(args.Key)
+	kv.config = kv.sm.Query(-1)
 	if(kv.config.Shards[shard] != kv.gid) {
 		reply.Err = ErrWrongGroup
 		return
 	}
 	
-	wrongLeader, _ := kv.TryCommit(args.ID, args.Key, args.Value, args.Op)
+	opRes := kv.TryCommit(args.ID, args.Key, args.Value, args.Op)
 	
-	if(wrongLeader) {
+	if(opRes.WrongLeader) {
 		reply.WrongLeader = true
 		// fmt.Printf("#### server: %v wrong leader\n", kv.me)
 		return
 	}
+	
+	// reply.Err = opRes.Err
 }
 
 //
@@ -344,7 +357,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	
 	go kv.HandleApplyMsg()
 	go kv.HandleLostLeader()
-	go kv.PollConfig()
+	// go kv.PollConfig()
 	
 	fmt.Printf("===== StartKVServer %v =====\n", me)
 	
