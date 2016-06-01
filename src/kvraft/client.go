@@ -1,26 +1,33 @@
-package raftkv
+package shardkv
+
+//
+// client code to talk to a sharded key/value service.
+//
+// the client first talks to the shardmaster to find out
+// the assignment of shards (keys) to groups, and then
+// talks to the group that holds the key's shard.
+//
 
 import "labrpc"
 import "crypto/rand"
 import "math/big"
+import "shardmaster"
 import "time"
-import "fmt"
 import "sync"
+import "fmt"
 
-type Clerk struct {
-	servers []*labrpc.ClientEnd
-	// You will have to modify this struct.
-	
-	id int
-	
-	leaderId int
-	
-	currId int
-	currIdMu *sync.Mutex
-	
-	rpcRequest chan interface{}
-	rpcMap map[int]chan interface{}
-	rpcMu *sync.Mutex
+//
+// which shard is a key in?
+// please use this function,
+// and please do not change it.
+//
+func key2shard(key string) int {
+	shard := 0
+	if len(key) > 0 {
+		shard = int(key[0])
+	}
+	shard %= shardmaster.NShards
+	return shard
 }
 
 func nrand() int64 {
@@ -30,27 +37,54 @@ func nrand() int64 {
 	return x
 }
 
-var gclientID = 0
+type Clerk struct {
+	sm       *shardmaster.Clerk
+	config   shardmaster.Config
+	make_end func(string) *labrpc.ClientEnd
+	// You will have to modify this struct.
+	
+	id int
+	
+	currId int
+	currIdMu *sync.Mutex
+	
+	rpcRequest chan interface{}
+	rpcMap map[int]chan interface{}
+	rpcMu *sync.Mutex
+	
+	leaderId int
+}
 
-func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
+var gclientID = 1
+
+//
+// the tester calls MakeClerk.
+//
+// masters[] is needed to call shardmaster.MakeClerk().
+//
+// make_end(servername) turns a server name from a
+// Config.Groups[gid][i] into a labrpc.ClientEnd on which you can
+// send RPCs.
+//
+func MakeClerk(masters []*labrpc.ClientEnd, make_end func(string) *labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
+	ck.sm = shardmaster.MakeClerk(masters)
+	ck.make_end = make_end
+	// You'll have to add code here.
 	ck.id = gclientID
 	gclientID++
-	
-	ck.servers = servers
-	ck.leaderId = -1
 	
 	ck.currId = 0
 	ck.currIdMu = &sync.Mutex{}
 	
-	ck.rpcRequest = make(chan interface{})
+	ck.rpcRequest = make(chan interface{}, 10)
 	ck.rpcMap = make(map[int]chan interface{})
 	ck.rpcMu = &sync.Mutex{}
 	
+	ck.leaderId = -1
+	
 	go ck.ProcessRpcRequest()
 	
-	// You'll have to add code here.
-	fmt.Println()
 	return ck
 }
 
@@ -64,19 +98,19 @@ func (ck *Clerk) NewID() int {
 	return newId
 }
 
-func (ck *Clerk) WrongLeader(reply interface{}) (wrongLeader bool, serverId int) {
+func (ck *Clerk) WrongLeader(reply interface{}) (wrongLeader bool, err Err) {
 	
 	switch replyType := reply.(type) {
 		case GetReply:
 			r := reply.(GetReply)
-			wrongLeader = r.WrongLeader == "true"
-			serverId = r.ServerId
+			wrongLeader = r.WrongLeader
+			err = r.Err
 			
 		case PutAppendReply:	
 			r := reply.(PutAppendReply)
-			wrongLeader = r.WrongLeader == "true"
-			serverId = r.ServerId
-			
+			wrongLeader = r.WrongLeader
+			err = r.Err
+						
 		default:
 			fmt.Printf("client: unknown reply type %v\n", replyType)
 	}
@@ -87,20 +121,20 @@ func (ck *Clerk) WrongLeader(reply interface{}) (wrongLeader bool, serverId int)
 func (ck *Clerk) RpcCall(server *labrpc.ClientEnd, args interface{}) (ok bool, reply interface{}){
 	switch argsType := args.(type) {
 			case GetArgs:
-				rpcName := "RaftKV.Get"
+				rpcName := "ShardKV.Get"
 				r := GetReply{}
 				getArgs := args.(GetArgs)
 				ok = server.Call(rpcName, &getArgs, &r)
 				reply = r
 				
 			case PutAppendArgs:	
-				rpcName := "RaftKV.PutAppend"
+				rpcName := "ShardKV.PutAppend"
 				r := PutAppendReply{}
-				putApendArgs := args.(PutAppendArgs)
+				putappendArgs := args.(PutAppendArgs)
 				
-				ok = server.Call(rpcName, &putApendArgs, &r)
+				ok = server.Call(rpcName, &putappendArgs, &r)
 				reply = r
-				
+								
 			default:
 				fmt.Printf("client: RpcCall, unknown args %v type %v\n", args, argsType)
 				return
@@ -109,116 +143,70 @@ func (ck *Clerk) RpcCall(server *labrpc.ClientEnd, args interface{}) (ok bool, r
 		return
 }
 
+func (ck *Clerk) RpcCallWithRetries(args interface{}) {
+	
+	var id int
+	var key string
+	
+	switch argsType := args.(type) {
+		case GetArgs:
+			id = args.(GetArgs).ID
+			key = args.(GetArgs).Key
+			
+		case PutAppendArgs:	
+			id = args.(PutAppendArgs).ID
+			key = args.(PutAppendArgs).Key
+						
+		default:
+			fmt.Printf("client: unknown args %v type %v\n", args, argsType)
+			return
+	}
+		
+	for {
+			shard := key2shard(key)
+			gid := ck.config.Shards[shard]
+			
+			servers, ok := ck.config.Groups[gid]
+			if(!ok) {
+				fmt.Printf("ERROR - client, gid not exists [%v]\n", gid)	
+			} else {
+			
+				// try each server for the shard.
+				for si := 0; si < len(servers); si++ {
+					srv := ck.make_end(servers[si])
+						
+					ok, reply := ck.RpcCall(srv, args)
+					wrongLeader, err := ck.WrongLeader(reply)
+					
+					// fmt.Printf("client, RPC call %v args %v, returns wrong leader %v err %v\n",
+					//	si, args, wrongLeader, err)
+					
+					if ok && wrongLeader == false && (err == OK || err == ErrNoKey) {
+						ck.rpcMap[id] <- reply
+						return
+					}
+					if ok && (err == ErrWrongGroup) {
+						break
+					}
+				}
+			}
+			
+			time.Sleep(100 * time.Millisecond)
+			// ask master for the latest configuration.
+			ck.config = ck.sm.Query(-1)
+		}
+}
+
 func (ck *Clerk) ProcessRpcRequest() {
 	
 	for {
 		
 		args:=<-ck.rpcRequest
-		var reply interface{}
-		var id int
-		
-		switch argsType := args.(type) {
-			case GetArgs:
-				id = args.(GetArgs).ID
-				
-			case PutAppendArgs:	
-				id = args.(PutAppendArgs).ID
-			
-			default:
-				fmt.Printf("client: unknown args %v type %v\n", args, argsType)
-				continue
-		}
-		
-		for {
-			// fmt.Printf("client [%v], leaderID %v\n", ck.id, ck.leaderId)
-			if(ck.leaderId == -1) {
-				
-				for i := 0;i<len(ck.servers);i++ {
-					ok, r := ck.RpcCall(ck.servers[i], args)
-					reply = r
-					
-					//fmt.Printf("----> client, %v Get ok %v reply %v\n", 
-					//	i, ok, reply)
-					
-					wrongLeader, serverId := ck.WrongLeader(reply)
-					if(!ok || wrongLeader) {
-						time.Sleep(500 * time.Millisecond)
-						continue
-					}
-					
-					fmt.Printf("    leader is %v server id %v\n", i, serverId)
-					ck.leaderId = i
-					
-					break
-				}
-			} else {
-				
-				success := false
-				for retry := 0;retry < 5; retry ++ {
-					ok, r := ck.RpcCall(ck.servers[ck.leaderId], args)
-					reply = r
-					
-					if(!ok) {
-						time.Sleep(500 * time.Millisecond)
-						continue
-					}
-					
-					wrongLeader, _ := ck.WrongLeader(reply)
-					
-					if(wrongLeader) {
-						fmt.Printf("client, wrong leader %v\n", ck.leaderId)
-						ck.leaderId = -1
-						
-						break;
-					}
-					
-					// ck.leaderId = serverId
-					success = true
-					break
-				}
-				
-				if(!success){
-					ck.leaderId = -1
-				}
-			}
-			
-			if(ck.leaderId != -1) {
-				ck.rpcMap[id] <- reply
-				
-				break
-			}
-			
-			time.Sleep(1 * time.Second)
-		}
+		go ck.RpcCallWithRetries(args)
 	}	
 }
 
-func (ck *Clerk) RpcCallAndWait(key string, value string, op OPCode) (reply interface{}) {
-	
-	id := ck.NewID()
-	var args interface{}
-	
-	switch op {
-		case Get:
-			a := GetArgs{}
-			a.ID = id
-			a.Key = key
-			
-			args = a
-			
-		case Put,Append:
-			a := PutAppendArgs{}
-			a.ID = id
-			a.Key = key
-			a.Value = value
-			a.Op = op
-			
-			args = a
-			
-		default:
-			fmt.Printf("client: unknown op type %v\n", op)
-			return
-	}
+func (ck *Clerk) RpcCallAndWait(id int, args interface{}) (reply interface{}) {
 	
 	ch := make(chan interface{})
 	
@@ -226,7 +214,6 @@ func (ck *Clerk) RpcCallAndWait(key string, value string, op OPCode) (reply inte
 	ck.rpcMap[id] = ch
 	ck.rpcMu.Unlock()
 	
-	// fmt.Printf("client: enqueue rpc request %v \n", args)
 	ck.rpcRequest <- args
 	
 	r:=<-ch
@@ -239,66 +226,63 @@ func (ck *Clerk) RpcCallAndWait(key string, value string, op OPCode) (reply inte
 // fetch the current value for a key.
 // returns "" if the key does not exist.
 // keeps trying forever in the face of all other errors.
-//
-// you can send an RPC with code like this:
-// ok := ck.servers[i].Call("RaftKV.Get", &args, &reply)
-//
-// the types of args and reply (including whether they are pointers)
-// must match the declared types of the RPC handler function's
-// arguments. and reply must be passed as a pointer.
+// You will have to modify this function.
 //
 func (ck *Clerk) Get(key string) string {
+	args := GetArgs{}
+	args.Key = key
+	args.ID = ck.NewID()
 	
-	fmt.Printf("client %v start Get %v\n", ck.id, key)
+	// fmt.Printf("\n------> client, Get Index [%v] -----\n", key)
 	
-	r := ck.RpcCallAndWait(key, "", Get)
+	r := ck.RpcCallAndWait(args.ID, args)
 	reply := r.(GetReply)
 	
-	if(reply.Err != Err_Success) {
+	if(reply.Err != OK) {
 		fmt.Printf(">> client, Failed to Get [%v] ,%v\n", 
-			key, reply.Err)
+			args.ID, reply.Err)
 		
 		return ""
 	}
 	
-	fmt.Printf(">> client, Get [%v] = %v\n", 
-		key, reply.Value)
-				
-	// You will have to modify this function.
+	fmt.Printf("<------ client, Get Index [%v], [%v]=[%v] -----\n\n", args.ID, key, reply.Value)
+	
 	return reply.Value
 }
 
 //
 // shared by Put and Append.
-//
-// you can send an RPC with code like this:
-// ok := ck.servers[i].Call("RaftKV.PutAppend", &args, &reply)
-//
-// the types of args and reply (including whether they are pointers)
-// must match the declared types of the RPC handler function's
-// arguments. and reply must be passed as a pointer.
+// You will have to modify this function.
 //
 func (ck *Clerk) PutAppend(key string, value string, op OPCode) {
+	args := PutAppendArgs{}
+	args.Key = key
+	args.Value = value
+	args.Op = op
+	args.ID = ck.NewID()
 	
-	r := ck.RpcCallAndWait(key, value, op)
+	fmt.Printf("\n------> client, PutAppend Index [%v], [%v] [%v] [%v] -----\n", 
+		args.ID, key, op, value)
+		
+	r := ck.RpcCallAndWait(args.ID, args)
 	reply := r.(PutAppendReply)
 	
-	if(reply.Err != Err_Success) {
-		fmt.Printf(">> client, Failed to PutAppend [%v]=[%v] ,%v\n", 
-			key, value, reply.Err)
+	if(reply.Err != OK) {
+		fmt.Printf(">> client, Index [%v] Failed to PutAppend [%v] [%v] [%v],%v\n\n", 
+			args.ID, key, op, value, reply.Err)
 		
-		return
+		return 
 	}
 	
-	fmt.Printf(">> client, server PutAppend [%v] = %v\n", 
-		key, value)
-		
+	fmt.Printf("<------ client, PutAppend Index [%v], [%v] [%v] [%v] -----\n\n", 
+		args.ID, key, op, value)
+	
 	return
 }
 
 func (ck *Clerk) Put(key string, value string) {
-	ck.PutAppend(key, value, Put)
+	ck.PutAppend(key, value, OPPut)
 }
 func (ck *Clerk) Append(key string, value string) {
-	ck.PutAppend(key, value, Append)
+	ck.PutAppend(key, value, OPAppend)
 }
